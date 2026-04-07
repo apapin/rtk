@@ -474,6 +474,271 @@ fn rewrite_line_range(cmd: &str) -> Option<String> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrepFlagKind {
+    Safe,
+    SafeTakesValue,
+    Unsupported,
+}
+
+/// Split a single shell command into words while preserving original quoting.
+fn split_shell_words_preserve(input: &str) -> Option<Vec<String>> {
+    let tokens = tokenize(input);
+    if tokens.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut prev_end = 0usize;
+    let mut have_prev = false;
+
+    for token in tokens {
+        match token.kind {
+            TokenKind::Operator | TokenKind::Pipe | TokenKind::Redirect => return None,
+            _ => {}
+        }
+
+        if have_prev {
+            let between = &input[prev_end..token.offset];
+            if between.chars().any(char::is_whitespace) {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            } else {
+                current.push_str(between);
+            }
+        }
+
+        current.push_str(&token.value);
+        prev_end = token.offset + token.value.len();
+        have_prev = true;
+    }
+
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    Some(words)
+}
+
+fn grep_long_flag_kind(arg: &str) -> GrepFlagKind {
+    let flag = arg.trim_start_matches('-');
+    let (name, has_inline_value) = match flag.split_once('=') {
+        Some((name, _)) => (name, true),
+        None => (flag, false),
+    };
+
+    if matches!(
+        name,
+        "count"
+            | "files"
+            | "files-with-matches"
+            | "files-without-match"
+            | "max-count"
+            | "regexp"
+            | "file"
+            | "quiet"
+            | "json"
+            | "passthru"
+            | "replace"
+    ) {
+        return GrepFlagKind::Unsupported;
+    }
+
+    if matches!(
+        name,
+        "after-context"
+            | "before-context"
+            | "context"
+            | "glob"
+            | "iglob"
+            | "type"
+            | "type-not"
+            | "max-columns"
+            | "max-filesize"
+            | "pre"
+            | "pre-glob"
+            | "sort"
+            | "sortr"
+            | "path-separator"
+            | "colors"
+            | "encoding"
+            | "engine"
+            | "threads"
+            | "dfa-size-limit"
+            | "regex-size-limit"
+            | "include"
+            | "exclude"
+            | "exclude-dir"
+            | "binary-files"
+            | "directories"
+            | "devices"
+            | "label"
+            | "message"
+    ) {
+        if has_inline_value {
+            GrepFlagKind::Safe
+        } else {
+            GrepFlagKind::SafeTakesValue
+        }
+    } else {
+        GrepFlagKind::Safe
+    }
+}
+
+fn grep_short_flag_kind(arg: &str) -> GrepFlagKind {
+    let mut chars = arg.trim_start_matches('-').chars().peekable();
+    if chars.peek().is_none() {
+        return GrepFlagKind::Unsupported;
+    }
+
+    while let Some(ch) = chars.next() {
+        if matches!(ch, 'c' | 'e' | 'f' | 'l' | 'L' | 'm' | 'q') {
+            return GrepFlagKind::Unsupported;
+        }
+
+        if matches!(ch, 'A' | 'B' | 'C' | 'd' | 'g' | 'j' | 'M' | 't' | 'T') {
+            return if chars.peek().is_some() {
+                GrepFlagKind::Safe
+            } else {
+                GrepFlagKind::SafeTakesValue
+            };
+        }
+
+        if matches!(
+            ch,
+            'E' | 'F'
+                | 'G'
+                | 'H'
+                | 'h'
+                | 'I'
+                | 'i'
+                | 'n'
+                | 'o'
+                | 'P'
+                | 'p'
+                | 'R'
+                | 'r'
+                | 'S'
+                | 's'
+                | 'U'
+                | 'u'
+                | 'V'
+                | 'v'
+                | 'w'
+                | 'x'
+                | 'z'
+                | 'a'
+        ) {
+            continue;
+        }
+
+        return GrepFlagKind::Unsupported;
+    }
+
+    GrepFlagKind::Safe
+}
+
+fn consume_rewritable_grep_flag(
+    words: &[String],
+    i: &mut usize,
+    out: &mut Vec<String>,
+) -> Option<()> {
+    let word = words.get(*i)?;
+    let kind = if word.starts_with("--") {
+        grep_long_flag_kind(word)
+    } else {
+        grep_short_flag_kind(word)
+    };
+
+    match kind {
+        GrepFlagKind::Unsupported => None,
+        GrepFlagKind::Safe => {
+            out.push(word.clone());
+            *i += 1;
+            Some(())
+        }
+        GrepFlagKind::SafeTakesValue => {
+            out.push(word.clone());
+            *i += 1;
+            out.push(words.get(*i)?.clone());
+            *i += 1;
+            Some(())
+        }
+    }
+}
+
+/// Rewrite raw `rg`/`grep` syntax into RTK's canonical `rtk grep <pattern> [path] [args...]` form.
+///
+/// This keeps common search flags while skipping forms that change grep's output shape
+/// (`-c`, `-l`, `-m`, `-e`, `-f`, `--json`, etc.), since RTK's grouped renderer cannot
+/// preserve those semantics safely.
+fn rewrite_grep_command(cmd_clean: &str) -> Option<String> {
+    let words = split_shell_words_preserve(cmd_clean)?;
+    if words.is_empty() {
+        return None;
+    }
+
+    let cmd_name = std::path::Path::new(&words[0])
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())?;
+    if cmd_name != "rg" && cmd_name != "grep" {
+        return None;
+    }
+
+    let mut i = 1;
+    let mut extra_args = Vec::new();
+    let mut pattern = None;
+
+    while i < words.len() {
+        let word = &words[i];
+        if word == "--" {
+            i += 1;
+            pattern = words.get(i).cloned();
+            i += 1;
+            break;
+        }
+        if !word.starts_with('-') || word == "-" {
+            pattern = Some(word.clone());
+            i += 1;
+            break;
+        }
+        consume_rewritable_grep_flag(&words, &mut i, &mut extra_args)?;
+    }
+
+    let pattern = pattern?;
+    let mut path = None;
+
+    while i < words.len() {
+        let word = &words[i];
+        if word.starts_with('-') && word != "-" {
+            consume_rewritable_grep_flag(&words, &mut i, &mut extra_args)?;
+            continue;
+        }
+
+        if path.is_none() {
+            path = Some(word.clone());
+        } else {
+            extra_args.push(word.clone());
+        }
+        i += 1;
+    }
+
+    let path = path.or_else(|| (!extra_args.is_empty()).then(|| ".".to_string()));
+    let mut rewritten = format!("rtk grep {}", pattern);
+    if let Some(path) = path {
+        rewritten.push(' ');
+        rewritten.push_str(&path);
+    }
+    if !extra_args.is_empty() {
+        rewritten.push(' ');
+        rewritten.push_str(&extra_args.join(" "));
+    }
+
+    Some(rewritten)
+}
+
 /// Rewrite a single (non-compound) command segment.
 /// Returns `Some(rewritten)` if matched (including already-RTK pass-through).
 /// Returns `None` if no match (caller uses original segment).
@@ -548,6 +813,11 @@ fn rewrite_segment(seg: &str, excluded: &[String]) -> Option<String> {
         {
             return None;
         }
+    }
+
+    if rule.rtk_cmd == "rtk grep" {
+        let rewritten = rewrite_grep_command(cmd_clean)?;
+        return Some(format!("{}{}{}", env_prefix, rewritten, redirect_suffix));
     }
 
     // Try each rewrite prefix (longest first) with word-boundary check
@@ -1077,6 +1347,43 @@ mod tests {
         assert_eq!(
             rewrite_command("rg \"fn main\"", &[]),
             Some("rtk grep \"fn main\"".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_rg_reorders_flags_around_pattern_and_path() {
+        assert_eq!(
+            rewrite_command(r#"rg -n "foo|bar" -S ."#, &[]),
+            Some(r#"rtk grep "foo|bar" . -n -S"#.into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_grep_reorders_recursive_flag_cluster() {
+        assert_eq!(
+            rewrite_command("grep -rni slack .", &[]),
+            Some("rtk grep slack . -rni".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_rg_with_extra_args_and_implicit_dot_path() {
+        assert_eq!(
+            rewrite_command("rg -g '*.rs' TODO", &[]),
+            Some("rtk grep TODO . -g '*.rs'".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_rg_skips_ambiguous_max_count_flag() {
+        assert_eq!(rewrite_command("rg -m 5 TODO .", &[]), None);
+    }
+
+    #[test]
+    fn test_rewrite_rg_absolute_path_binary() {
+        assert_eq!(
+            rewrite_command("/opt/homebrew/bin/rg -n TODO -S .", &[]),
+            Some("rtk grep TODO . -n -S".into())
         );
     }
 
