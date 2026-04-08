@@ -4,6 +4,267 @@ use crate::core::config;
 use crate::core::tracking;
 use crate::core::utils::{exit_code_from_output, resolved_command};
 use anyhow::{Context, Result};
+
+const DEFAULT_MAX_LINE_LEN: usize = 80;
+const DEFAULT_MAX_RESULTS: usize = 200;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedGrepArgs {
+    pattern: String,
+    path: String,
+    max_line_len: usize,
+    max_results: usize,
+    context_only: bool,
+    file_type: Option<String>,
+    extra_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtraFlagKind {
+    NoValue,
+    TakesValue,
+}
+
+fn extra_long_flag_kind(arg: &str) -> ExtraFlagKind {
+    let flag = arg.trim_start_matches('-');
+    let (name, has_inline_value) = match flag.split_once('=') {
+        Some((name, _)) => (name, true),
+        None => (flag, false),
+    };
+
+    if matches!(
+        name,
+        "after-context"
+            | "before-context"
+            | "context"
+            | "glob"
+            | "iglob"
+            | "type"
+            | "type-not"
+            | "max-columns"
+            | "max-filesize"
+            | "pre"
+            | "pre-glob"
+            | "sort"
+            | "sortr"
+            | "path-separator"
+            | "colors"
+            | "encoding"
+            | "engine"
+            | "threads"
+            | "dfa-size-limit"
+            | "regex-size-limit"
+            | "include"
+            | "exclude"
+            | "exclude-dir"
+            | "binary-files"
+            | "directories"
+            | "devices"
+            | "label"
+            | "message"
+    ) && !has_inline_value
+    {
+        ExtraFlagKind::TakesValue
+    } else {
+        ExtraFlagKind::NoValue
+    }
+}
+
+fn extra_short_flag_kind(arg: &str) -> ExtraFlagKind {
+    let mut chars = arg.trim_start_matches('-').chars().peekable();
+    if chars.peek().is_none() {
+        return ExtraFlagKind::NoValue;
+    }
+
+    while let Some(ch) = chars.next() {
+        if matches!(ch, 'A' | 'B' | 'C' | 'd' | 'g' | 'j' | 'M' | 'T') {
+            return if chars.peek().is_some() {
+                ExtraFlagKind::NoValue
+            } else {
+                ExtraFlagKind::TakesValue
+            };
+        }
+    }
+
+    ExtraFlagKind::NoValue
+}
+
+fn consume_extra_flag(args: &[String], i: &mut usize, extra_args: &mut Vec<String>) -> Result<()> {
+    let arg = args.get(*i).context("missing grep flag")?;
+    let kind = if arg.starts_with("--") {
+        extra_long_flag_kind(arg)
+    } else {
+        extra_short_flag_kind(arg)
+    };
+
+    extra_args.push(arg.clone());
+    *i += 1;
+
+    if kind == ExtraFlagKind::TakesValue {
+        extra_args.push(
+            args.get(*i)
+                .context(format!("missing value for grep flag '{}'", arg))?
+                .clone(),
+        );
+        *i += 1;
+    }
+
+    Ok(())
+}
+
+fn consume_rtk_flag(
+    args: &[String],
+    i: &mut usize,
+    max_line_len: &mut usize,
+    max_results: &mut usize,
+    context_only: &mut bool,
+    file_type: &mut Option<String>,
+) -> Result<bool> {
+    let arg = args.get(*i).context("missing grep argument")?;
+    match arg.as_str() {
+        "-c" | "--context-only" => {
+            *context_only = true;
+            *i += 1;
+            Ok(true)
+        }
+        "-n" | "--line-numbers" => {
+            *i += 1;
+            Ok(true)
+        }
+        "-l" | "--max-len" => {
+            *i += 1;
+            *max_line_len = args
+                .get(*i)
+                .context("missing value for --max-len")?
+                .parse()
+                .context("invalid --max-len value")?;
+            *i += 1;
+            Ok(true)
+        }
+        "-m" | "--max" => {
+            *i += 1;
+            *max_results = args
+                .get(*i)
+                .context("missing value for --max")?
+                .parse()
+                .context("invalid --max value")?;
+            *i += 1;
+            Ok(true)
+        }
+        "-t" | "--file-type" => {
+            *i += 1;
+            *file_type = Some(
+                args.get(*i)
+                    .context("missing value for --file-type")?
+                    .clone(),
+            );
+            *i += 1;
+            Ok(true)
+        }
+        _ if arg.starts_with("--max-len=") => {
+            *max_line_len = arg["--max-len=".len()..]
+                .parse()
+                .context("invalid --max-len value")?;
+            *i += 1;
+            Ok(true)
+        }
+        _ if arg.starts_with("--max=") => {
+            *max_results = arg["--max=".len()..]
+                .parse()
+                .context("invalid --max value")?;
+            *i += 1;
+            Ok(true)
+        }
+        _ if arg.starts_with("--file-type=") => {
+            *file_type = Some(arg["--file-type=".len()..].to_string());
+            *i += 1;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn parse_grep_args(args: &[String]) -> Result<ParsedGrepArgs> {
+    let mut max_line_len = DEFAULT_MAX_LINE_LEN;
+    let mut max_results = DEFAULT_MAX_RESULTS;
+    let mut context_only = false;
+    let mut file_type = None;
+    let mut extra_args = Vec::new();
+    let mut pattern = None;
+    let mut path = None;
+    let mut i = 0;
+    let mut force_positional = false;
+
+    while i < args.len() {
+        let arg = &args[i];
+
+        if arg == "--" && !force_positional {
+            force_positional = true;
+            i += 1;
+            continue;
+        }
+
+        if !force_positional
+            && consume_rtk_flag(
+                args,
+                &mut i,
+                &mut max_line_len,
+                &mut max_results,
+                &mut context_only,
+                &mut file_type,
+            )?
+        {
+            continue;
+        }
+
+        if pattern.is_none() {
+            if !force_positional && arg.starts_with('-') && arg != "-" {
+                consume_extra_flag(args, &mut i, &mut extra_args)?;
+            } else {
+                pattern = Some(arg.clone());
+                i += 1;
+            }
+            continue;
+        }
+
+        if !force_positional && arg.starts_with('-') && arg != "-" {
+            consume_extra_flag(args, &mut i, &mut extra_args)?;
+            continue;
+        }
+
+        if path.is_none() {
+            path = Some(arg.clone());
+        } else {
+            extra_args.push(arg.clone());
+        }
+        i += 1;
+    }
+
+    Ok(ParsedGrepArgs {
+        pattern: pattern.context("rtk grep requires a pattern")?,
+        path: path.unwrap_or_else(|| ".".to_string()),
+        max_line_len,
+        max_results,
+        context_only,
+        file_type,
+        extra_args,
+    })
+}
+
+pub fn run_from_args(args: &[String], verbose: u8) -> Result<i32> {
+    let parsed = parse_grep_args(args)?;
+    run(
+        &parsed.pattern,
+        &parsed.path,
+        parsed.max_line_len,
+        parsed.max_results,
+        parsed.context_only,
+        parsed.file_type.as_deref(),
+        &parsed.extra_args,
+        verbose,
+    )
+}
+
 use regex::Regex;
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -241,6 +502,85 @@ mod tests {
         // This is a compile-time test - if it compiles, the signature is correct
         let _extra: Vec<String> = vec!["-i".to_string(), "-A".to_string(), "3".to_string()];
         // No need to actually run - we're verifying the parameter exists
+    }
+
+    #[test]
+    fn test_parse_grep_args_supports_ripgrep_style_ordering() {
+        let parsed = parse_grep_args(&[
+            "slack".to_string(),
+            "-S".to_string(),
+            ".".to_string(),
+        ])
+        .expect("should parse");
+
+        assert_eq!(parsed.pattern, "slack");
+        assert_eq!(parsed.path, ".");
+        assert_eq!(parsed.extra_args, vec!["-S"]);
+        assert_eq!(parsed.max_line_len, DEFAULT_MAX_LINE_LEN);
+        assert_eq!(parsed.max_results, DEFAULT_MAX_RESULTS);
+    }
+
+    #[test]
+    fn test_parse_grep_args_supports_flags_before_pattern() {
+        let parsed = parse_grep_args(&[
+            "-S".to_string(),
+            "slack".to_string(),
+            ".".to_string(),
+        ])
+        .expect("should parse");
+
+        assert_eq!(parsed.pattern, "slack");
+        assert_eq!(parsed.path, ".");
+        assert_eq!(parsed.extra_args, vec!["-S"]);
+    }
+
+    #[test]
+    fn test_parse_grep_args_keeps_rtk_options_anywhere() {
+        let parsed = parse_grep_args(&[
+            "slack".to_string(),
+            "-m".to_string(),
+            "25".to_string(),
+            "-t".to_string(),
+            "rs".to_string(),
+            "-S".to_string(),
+            ".".to_string(),
+        ])
+        .expect("should parse");
+
+        assert_eq!(parsed.pattern, "slack");
+        assert_eq!(parsed.path, ".");
+        assert_eq!(parsed.max_results, 25);
+        assert_eq!(parsed.file_type.as_deref(), Some("rs"));
+        assert_eq!(parsed.extra_args, vec!["-S"]);
+    }
+
+    #[test]
+    fn test_parse_grep_args_consumes_extra_flag_values() {
+        let parsed = parse_grep_args(&[
+            "-A".to_string(),
+            "3".to_string(),
+            "slack".to_string(),
+            ".".to_string(),
+        ])
+        .expect("should parse");
+
+        assert_eq!(parsed.pattern, "slack");
+        assert_eq!(parsed.path, ".");
+        assert_eq!(parsed.extra_args, vec!["-A", "3"]);
+    }
+
+    #[test]
+    fn test_parse_grep_args_defaults_path_when_only_pattern_and_flags() {
+        let parsed = parse_grep_args(&[
+            "slack".to_string(),
+            "-g".to_string(),
+            "*.rs".to_string(),
+        ])
+        .expect("should parse");
+
+        assert_eq!(parsed.pattern, "slack");
+        assert_eq!(parsed.path, ".");
+        assert_eq!(parsed.extra_args, vec!["-g", "*.rs"]);
     }
 
     #[test]

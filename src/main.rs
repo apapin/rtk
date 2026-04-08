@@ -274,29 +274,9 @@ enum Commands {
 
     /// Compact grep - strips whitespace, truncates, groups by file
     Grep {
-        /// Pattern to search
-        pattern: String,
-        /// Path to search in
-        #[arg(default_value = ".")]
-        path: String,
-        /// Max line length
-        #[arg(short = 'l', long, default_value = "80")]
-        max_len: usize,
-        /// Max results to show
-        #[arg(short, long, default_value = "200")]
-        max: usize,
-        /// Show only match context (not full line)
-        #[arg(short, long)]
-        context_only: bool,
-        /// Filter by file type (e.g., ts, py, rust)
-        #[arg(short = 't', long)]
-        file_type: Option<String>,
-        /// Show line numbers (always on, accepted for grep/rg compatibility)
-        #[arg(short = 'n', long)]
-        line_numbers: bool,
-        /// Extra ripgrep arguments (e.g., -i, -A 3, -w, --glob)
+        /// All grep arguments (supports both RTK and native rg/grep syntax)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        extra_args: Vec<String>,
+        args: Vec<String>,
     },
 
     /// Initialize rtk instructions for assistant CLI usage
@@ -1574,25 +1554,7 @@ fn run_cli() -> Result<i32> {
             summary::run(&cmd, cli.verbose)?
         }
 
-        Commands::Grep {
-            pattern,
-            path,
-            max_len,
-            max,
-            context_only,
-            file_type,
-            line_numbers: _, // no-op: line numbers always enabled in grep_cmd::run
-            extra_args,
-        } => grep_cmd::run(
-            &pattern,
-            &path,
-            max_len,
-            max,
-            context_only,
-            file_type.as_deref(),
-            &extra_args,
-            cli.verbose,
-        )?,
+        Commands::Grep { args } => grep_cmd::run_from_args(&args, cli.verbose)?,
 
         Commands::Init {
             global,
@@ -2515,6 +2477,20 @@ mod tests {
                     }
                     _ => panic!("expected Rewrite command"),
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_grep_clap_accepts_ripgrep_style_args() {
+        let result = Cli::try_parse_from(["rtk", "grep", "slack", "-S", "."]);
+        assert!(result.is_ok());
+        if let Ok(cli) = result {
+            match cli.command {
+                Commands::Grep { ref args } => {
+                    assert_eq!(args, &vec!["slack", "-S", "."]);
+                }
+                _ => panic!("expected Grep command"),
             }
         }
     }
